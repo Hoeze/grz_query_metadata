@@ -27,6 +27,27 @@ def test_sheet_name_strips_illegal_characters_and_fits_the_31_character_cap():
     assert name.endswith("bioinformaticsPipelineName")  # the tail is kept — it distinguishes labels
 
 
+def test_row_order_sorts_numeric_labels_numerically():
+    # The duplicate-per-LE distribution is keyed by a count, and its rows tie
+    # constantly; alphabetically "10" would land between "1" and "2".
+    assert sorted(["10", "2", "1"], key=mod.row_order) == ["1", "2", "10"]
+
+
+def test_row_order_leaves_everything_else_alphabetical():
+    assert sorted(["wgs", "1", "panel"], key=mod.row_order) == ["1", "panel", "wgs"]
+
+
+def test_sheet_name_keeps_the_head_of_a_label_that_is_not_a_path():
+    # A derived metric has no shared prefix to drop, so cutting its head leaves
+    # gibberish: "duplicate_initial..." must not become "cate_initial...".
+    assert mod.sheet_name("duplicate_initial_submissions_per_LE").startswith("duplicate_initial")
+    assert mod.sheet_name("initial_submissions_checked_for_duplicates").startswith("initial_sub")
+
+
+def test_sheet_name_leaves_a_short_label_alone():
+    assert mod.sheet_name("labData.libraryType") == "labData.libraryType"
+
+
 def test_sheet_name_never_comes_back_empty():
     assert mod.sheet_name("[]:*?/\\") == "field"
 
@@ -43,6 +64,7 @@ def report(label, **fields):
         "submissions_in_table": 10,
         "submissions_with_metadata": 9,
         "submissions_unparseable": 0,
+        "duplicate_check_available": True,
         "enum_fields": {},
         "freetext_fields": {},
         "derived": {},
@@ -107,8 +129,8 @@ class TestSheetFunctions:
         rows = mod.summary_rows([report("GRZ_A"), report("GRZ_B")])
         source = "submission/genomicDataCenterId"
         assert values_of(rows)[1:] == [
-            ["GRZ_A", 10, 9, 0, source, "1.1.0", "2026-08-13"],
-            ["GRZ_B", 10, 9, 0, source, "1.1.0", "2026-08-13"],
+            ["GRZ_A", 10, 9, 0, "yes", source, "1.1.0", "2026-08-13"],
+            ["GRZ_B", 10, 9, 0, "yes", source, "1.1.0", "2026-08-13"],
             [],
             ["TOTAL", 20, 18, 0],
         ]
@@ -120,6 +142,33 @@ class TestSheetFunctions:
         mixed = mod.summary_rows([report("GRZ_A"), report("GRZ_B", script_version="2.0.0")])
         assert mixed[-1].style == ods.PROBLEM
         assert "1.1.0" in mixed[-1].values[0] and "2.0.0" in mixed[-1].values[0]
+
+    @pytest.mark.parametrize(
+        "flag,expected",
+        [
+            ({"duplicate_check_available": True}, "yes"),
+            ({"duplicate_check_available": False}, "no"),
+            ({}, "unknown"),
+        ],
+    )
+    def test_summary_says_whether_the_duplicate_check_could_run(self, flag, expected):
+        # A report from before the check existed carries no such key at all.
+        r = report("GRZ_A", **flag)
+        if not flag:
+            del r["duplicate_check_available"]
+        assert mod.duplicate_check_status(r) == expected
+        assert values_of(mod.summary_rows([r]))[1][4] == expected
+
+    def test_summary_warns_when_a_grz_never_ran_the_duplicate_check(self):
+        # Its sheet shows zeroes either way; only this row tells them apart.
+        clean = mod.summary_rows([report("GRZ_A"), report("GRZ_B")])
+        assert not any("duplicate initial submissions" in str(r.values) for r in clean)
+
+        mixed = mod.summary_rows([report("GRZ_A"), report("GRZ_B", duplicate_check_available=False)])
+        assert mixed[-1].style == ods.PROBLEM
+        warning = mixed[-1].values[0]
+        assert "GRZ_B" in warning and "GRZ_A" not in warning
+        assert "not checked" in warning
 
     def test_index_leaves_the_schema_columns_empty_without_one(self):
         fields = mod.collect_fields([report("A", enum_fields={"labData.libraryType": field({"wgs": 1})})])
@@ -204,6 +253,7 @@ class TestSpreadsheet:
             10,
             9,
             0,
+            "yes",
             "submission/genomicDataCenterId",
             "1.1.0",
             "2026-08-13",

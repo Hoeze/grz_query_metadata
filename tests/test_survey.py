@@ -68,6 +68,156 @@ class TestCountSubmission:
         assert sum(c["tissueTypeId_is_BTO_format"].values()) == 0
 
 
+class TestInitialSubmissions:
+    """Duplicate initial submissions per Leistungserbringer."""
+
+    def fold(self, *metas, qc_passed: bool | None = True) -> mod.Counters:
+        """Fold submissions in, taking each case id from the metadata the way the
+        `pseudonym` column would hold it on an unredacted row."""
+        c = counters()
+        initials = mod.InitialSubmissions()
+        for meta in metas:
+            initials.add(meta, qc_passed, (meta.get("submission") or {}).get("localCaseId"))
+        initials.write(c)
+        return c
+
+    def test_one_initial_per_case_is_no_duplicate(self, submission):
+        c = self.fold(submission(local_case_id="a"), submission(local_case_id="b"))
+        # One LE, nothing duplicated — it still has to show up in the distribution.
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"0": 1})
+
+    def test_a_second_initial_for_the_same_case_is_one_duplicate(self, submission):
+        c = self.fold(submission(local_case_id="a"), submission(local_case_id="a"))
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"1": 1})
+
+    @pytest.mark.parametrize("sent,duplicates", [(3, "2"), (7, "6"), (30, "29")])
+    def test_the_row_label_is_the_exact_count(self, sent, duplicates, submission):
+        c = self.fold(*[submission(local_case_id="a")] * sent)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({duplicates: 1})
+
+    def test_duplicates_of_two_cases_add_up_for_the_same_LE(self, submission):
+        c = self.fold(
+            *[submission(local_case_id="a")] * 2,
+            *[submission(local_case_id="b")] * 3,
+        )
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"3": 1})
+
+    def test_the_same_case_id_at_two_LEs_is_not_a_duplicate(self, submission):
+        # localCaseId is the LE's own numbering, so it only means anything
+        # within one LE; two of them may well pick "case-1".
+        c = self.fold(
+            submission(submitter_id="260000001", local_case_id="a"),
+            submission(submitter_id="260000002", local_case_id="a"),
+        )
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"0": 2})
+
+    def test_each_LE_is_counted_separately(self, submission):
+        c = self.fold(
+            *[submission(submitter_id="260000001", local_case_id="a")] * 2,
+            submission(submitter_id="260000002", local_case_id="a"),
+        )
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"1": 1, "0": 1})
+
+    @pytest.mark.parametrize("submission_type", ["followup", "addition", "correction"])
+    def test_only_initial_submissions_count(self, submission_type, submission):
+        # Sending the same case again is what these types are FOR.
+        c = self.fold(*[submission(submission_type=submission_type, local_case_id="a")] * 2)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter()
+        assert c[mod.INITIALS_CHECKED] == collections.Counter(
+            {"yes": 0, mod.NOT_QC_PASSED: 0, mod.REDACTED_CASE_ID: 0, mod.NOT_ATTRIBUTABLE: 0}
+        )
+
+    @pytest.mark.parametrize("missing", [{"submitter_id": None}, {"local_case_id": None}])
+    def test_an_initial_missing_an_identifier_is_counted_apart(self, missing, submission):
+        # It cannot be grouped, so it must not quietly lower the duplicate count.
+        c = self.fold(submission(local_case_id="a"), submission(**missing))
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"0": 1})
+        assert c[mod.INITIALS_CHECKED] == collections.Counter(
+            {"yes": 1, mod.NOT_QC_PASSED: 0, mod.REDACTED_CASE_ID: 0, mod.NOT_ATTRIBUTABLE: 1}
+        )
+
+    @pytest.mark.parametrize("redacted", ["REDACTED_LOCAL_CASE_ID", ""])
+    def test_a_redacted_case_id_groups_nothing(self, redacted, submission):
+        # grz-db redacts localCaseId inside the stored metadata document. Keying
+        # on the placeholder would report every redacted submission of an LE as
+        # a duplicate of every other.
+        initials = mod.InitialSubmissions()
+        for _ in range(4):
+            initials.add(submission(local_case_id=redacted), True, redacted)
+        c = counters()
+        initials.write(c)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter()
+        assert c[mod.INITIALS_CHECKED][mod.REDACTED_CASE_ID] == 4
+
+    def test_the_column_wins_over_the_redacted_metadata(self, submission):
+        # The document says REDACTED_LOCAL_CASE_ID for both; the column knows
+        # they are two different cases, so neither is a duplicate.
+        initials = mod.InitialSubmissions()
+        for case in ("real-1", "real-2"):
+            initials.add(submission(local_case_id="REDACTED_LOCAL_CASE_ID"), True, case)
+        c = counters()
+        initials.write(c)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"0": 1})
+        assert c[mod.INITIALS_CHECKED]["yes"] == 2
+
+    @pytest.mark.parametrize("meta", [{}, {"submission": None}, {"submission": "not a dict"}])
+    def test_malformed_shapes_are_skipped_not_fatal(self, meta):
+        initials = mod.InitialSubmissions()
+        initials.add(meta, True, "a")
+        c = counters()
+        initials.write(c)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter()
+
+    @pytest.mark.parametrize("qc_passed", [False, None])
+    def test_a_submission_that_did_not_pass_qc_is_not_counted(self, qc_passed, submission):
+        # A rejected submission was MEANT to be sent again; counting the
+        # replacement would report the process working as a fault. None is
+        # "not decided yet", which is not a pass either.
+        c = self.fold(*[submission(local_case_id="a")] * 2, qc_passed=qc_passed)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter()
+        assert c[mod.INITIALS_CHECKED][mod.NOT_QC_PASSED] == 2
+
+    def test_only_the_qc_passed_ones_of_a_case_are_compared(self, submission):
+        initials = mod.InitialSubmissions()
+        initials.add(submission(local_case_id="a"), False, "a")  # rejected
+        initials.add(submission(local_case_id="a"), True, "a")  # the accepted retry
+        c = counters()
+        initials.write(c)
+        # One accepted initial submission for the case: nothing was duplicated.
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"0": 1})
+        assert c[mod.INITIALS_CHECKED] == collections.Counter(
+            {"yes": 1, mod.NOT_QC_PASSED: 1, mod.REDACTED_CASE_ID: 0, mod.NOT_ATTRIBUTABLE: 0}
+        )
+
+    def test_two_qc_passed_initials_for_one_case_are_a_duplicate(self, submission):
+        initials = mod.InitialSubmissions()
+        for qc in (True, False, True):
+            initials.add(submission(local_case_id="a"), qc, "a")
+        c = counters()
+        initials.write(c)
+        assert c[mod.DUPLICATE_INITIALS] == collections.Counter({"1": 1})
+
+    def test_duplicated_cases_names_them_worst_first(self, submission):
+        initials = mod.InitialSubmissions()
+        for meta in (
+            *[submission(submitter_id="LE1", local_case_id="a")] * 3,
+            *[submission(submitter_id="LE1", local_case_id="b")] * 2,
+            submission(submitter_id="LE1", local_case_id="c"),  # sent once: not duplicated
+            *[submission(submitter_id="LE2", local_case_id="a")] * 2,
+        ):
+            initials.add(meta, True, (meta["submission"] or {}).get("localCaseId"))
+        assert initials.duplicated_cases() == {
+            "LE1": [("a", 3), ("b", 2)],
+            "LE2": [("a", 2)],
+        }
+
+    def test_no_identifier_ever_reaches_the_counters(self, submission):
+        c = self.fold(submission(submitter_id="260000001", local_case_id="secret-case"))
+        written = json.dumps(mod.dump(c, [mod.DUPLICATE_INITIALS, mod.INITIALS_CHECKED]))
+        assert "260000001" not in written
+        assert "secret-case" not in written
+
+
 class TestDump:
     def test_absent_field_reports_zero(self):
         assert mod.dump(counters(), ["nope"])["nope"] == {"_total": 0, "_distinct": 0, "values": {}}
@@ -171,6 +321,92 @@ class TestEndToEnd:
         assert report["enum_fields"]["labData.libraryType"]["values"] == {"wgs": 1, "wxs": 1}
         assert report["freetext_fields"]["labData.labDataName"]["values"] == {"Blut DNA": 2}
         assert report["derived"]["tissueTypeId_is_BTO_format"]["values"] == {"yes": 2}
+        # Two initial submissions, two different cases, one LE: nothing duplicated.
+        assert report["derived"][mod.DUPLICATE_INITIALS]["values"] == {"0": 1}
+        assert report["derived"][mod.INITIALS_CHECKED]["values"] == {
+            "yes": 2,
+            mod.NOT_QC_PASSED: 0,
+            mod.REDACTED_CASE_ID: 0,
+            mod.NOT_ATTRIBUTABLE: 0,
+        }
+
+    def test_the_duplicates_are_named_on_the_console_but_not_in_the_report(
+        self, db_factory, submission, tmp_path, caplog
+    ):
+        # The console runs at the site that can go and look the case up; the
+        # report is what leaves. Only one of the two may carry identifiers.
+        db = db_factory([submission(submitter_id="260000001", local_case_id="ABC-17")] * 2)
+        out = tmp_path / "report.json"
+        with caplog.at_level("INFO"):
+            mod.main(["--db-url", str(db), "--out", str(out)])
+        assert "260000001: ABC-17 (2x)" in caplog.text
+        assert "stay on this machine" in caplog.text
+        written = out.read_text(encoding="utf-8")
+        assert "260000001" not in written
+        assert "ABC-17" not in written
+
+    def test_a_clean_database_says_so(self, db_factory, submission, tmp_path, caplog):
+        db = db_factory([submission(local_case_id="a"), submission(local_case_id="b")])
+        with caplog.at_level("INFO"):
+            mod.main(["--db-url", str(db), "--out", str(tmp_path / "report.json")])
+        assert "no Leistungserbringer duplicated a QC-passed initial submission (1 checked)" in caplog.text
+
+    def test_a_failed_submission_and_its_retry_are_not_a_duplicate(self, db_factory, submission, tmp_path):
+        db = db_factory(
+            [
+                (submission(local_case_id="a"), False),  # rejected by QC
+                (submission(local_case_id="a"), True),  # sent again, accepted
+            ]
+        )
+        out = tmp_path / "report.json"
+        mod.main(["--db-url", str(db), "--out", str(out)])
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["derived"][mod.DUPLICATE_INITIALS]["values"] == {"0": 1}
+        assert report["derived"][mod.INITIALS_CHECKED]["values"][mod.NOT_QC_PASSED] == 1
+
+    def test_the_case_id_comes_from_the_column_not_the_metadata(self, db_factory, submission, tmp_path):
+        # Both documents carry the redaction placeholder; the pseudonym column
+        # holds the real, distinct case ids. Reading the JSON would call these
+        # two a duplicate pair.
+        redacted = submission(local_case_id="REDACTED_LOCAL_CASE_ID")
+        db = db_factory([(redacted, True, "real-1"), (redacted, True, "real-2")])
+        out = tmp_path / "report.json"
+        mod.main(["--db-url", str(db), "--out", str(out)])
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["derived"][mod.DUPLICATE_INITIALS]["values"] == {"0": 1}
+        assert report["derived"][mod.INITIALS_CHECKED]["values"]["yes"] == 2
+
+    def test_a_database_without_the_qc_column_says_so_and_counts_nothing(
+        self, db_factory, submission, tmp_path, caplog
+    ):
+        # Reporting an unfiltered number as if it were filtered would be worse
+        # than reporting none; every other count has to survive regardless.
+        db = db_factory([submission(local_case_id="a")] * 2, with_qc_column=False)
+        out = tmp_path / "report.json"
+        with caplog.at_level("INFO"):
+            mod.main(["--db-url", str(db), "--out", str(out)])
+        assert mod.QC_COLUMN in caplog.text and mod.LOCAL_CASE_ID_COLUMN in caplog.text
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["derived"][mod.DUPLICATE_INITIALS]["values"] == {}
+        assert report["derived"][mod.INITIALS_CHECKED]["values"][mod.NOT_QC_PASSED] == 2
+        assert report["enum_fields"]["labData.libraryType"]["values"] == {"wgs": 2}
+
+    def test_reports_duplicate_initial_submissions_per_le(self, db_factory, submission, tmp_path):
+        db = db_factory(
+            [
+                submission(submitter_id="260000001", local_case_id="a"),
+                submission(submitter_id="260000001", local_case_id="a"),  # the duplicate
+                submission(submitter_id="260000001", local_case_id="b"),
+                submission(submitter_id="260000002", local_case_id="a"),
+            ]
+        )
+        out = tmp_path / "report.json"
+        mod.main(["--db-url", str(db), "--out", str(out)])
+        report = json.loads(out.read_text(encoding="utf-8"))
+        # 260000001 duplicated one case, 260000002 duplicated nothing.
+        assert report["derived"][mod.DUPLICATE_INITIALS]["values"] == {"1": 1, "0": 1}
+        assert report["derived"][mod.INITIALS_CHECKED]["values"]["yes"] == 4
+        assert "260000001" not in out.read_text(encoding="utf-8")
 
     def test_report_values_are_written_most_common_first(self, db_factory, submission, tmp_path):
         db = db_factory([submission(library_type="wxs"), submission(library_type="wxs"), submission()])

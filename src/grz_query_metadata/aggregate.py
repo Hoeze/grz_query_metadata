@@ -47,12 +47,33 @@ def normalise(v: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", v.lower())
 
 
+def row_order(value: str) -> tuple[int, int, str]:
+    """Tie-break between rows carrying the same total.
+
+    Alphabetical, except that a wholly numeric label sorts numerically. The
+    derived `duplicate_initial_submissions_per_LE` distribution is keyed by an
+    exact count, and its rows tie constantly — alphabetically it would put 10
+    before 2.
+    """
+    if re.fullmatch(r"[0-9]+", value):
+        return (0, int(value), "")
+    return (1, 0, value)
+
+
 def sheet_name(label: str) -> str:
     # ODF forbids []:*?/\ in a sheet name. The 31-character cap is Excel's, kept
-    # so that the file stays usable if someone opens it there; the tail is what
-    # distinguishes one field from another, so that is the end we keep.
+    # so that the file stays usable if someone opens it there.
     s = re.sub(r"[\[\]:*?/\\]", "", label)
-    return s[-31:] or "field"
+    if not s:
+        return "field"
+    if len(s) <= 31:
+        return s
+    # A label with a separator in it is a metadata path: its tail is the field
+    # name and its head a prefix shared with its neighbours, so the tail is what
+    # distinguishes one from another. A derived metric has no such prefix, and
+    # cutting its head leaves gibberish ("cate_initial_submissions_per_LE"), so
+    # there the head is the end to keep.
+    return s[-31:] if ("." in label or "/" in label) else s[:31]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -212,12 +233,12 @@ class Field:
     @cached_property
     def values(self) -> list[str]:
         """The rows of the sheet: every observed value plus every declared one,
-        most frequent first, ties broken alphabetically. Declared values nobody
-        used are included deliberately — that absence is the whole point of the
-        survey, and it is invisible otherwise."""
+        most frequent first, ties broken by :func:`row_order`. Declared values
+        nobody used are included deliberately — that absence is the whole point
+        of the survey, and it is invisible otherwise."""
         return sorted(
             self.observed | set(self.declared or []),
-            key=lambda v: (-self.total_for(v), v),
+            key=lambda v: (-self.total_for(v), row_order(v)),
         )
 
     @cached_property
@@ -285,21 +306,38 @@ def collect_fields(
     return fields
 
 
+def duplicate_check_status(report: dict) -> str:
+    """Whether this GRZ's database had the columns the duplicate check reads.
+
+    A report from before the check existed carries no such key, and "unknown" is
+    the honest rendering: like a "no", its duplicate figures are absent rather
+    than zero.
+    """
+    available = report.get("duplicate_check_available")
+    return "unknown" if available is None else ("yes" if available else "no")
+
+
 def summary_rows(reports: list[dict]) -> list[ods.Row]:
     """The **summary** sheet: one row per GRZ report, saying how many
     submissions its database held, how many of those carried metadata and how
     many could not be parsed, plus the version that produced it.
 
         GRZ | submissions in table | with metadata | unparseable |
-        id from | script version | generated
+        duplicate check ran | id from | script version | generated
 
     "id from" says where the GRZ column heading came from: the id the
     submissions themselves record, or a `--grz-id` someone typed. Only the
     latter can have been mistyped, so it is worth seeing at a glance.
 
-    Ends with a TOTAL row, and — if the reports were produced by different
-    versions of this tool, which makes their columns not strictly comparable —
-    a highlighted warning row naming the versions involved.
+    "duplicate check ran" says whether that database had the basic_qc_passed and
+    pseudonym columns the duplicate initial submission check reads. Where it did
+    not, the check counted nothing, and its sheet shows that GRZ a column of
+    zeroes that would otherwise read as a clean site.
+
+    Ends with a TOTAL row, then a highlighted warning row for each of two
+    things worth not missing: reports produced by different versions of this
+    tool, whose columns are not strictly comparable, and GRZs whose duplicate
+    check never ran.
     """
     rows = [
         ods.Row(
@@ -308,6 +346,7 @@ def summary_rows(reports: list[dict]) -> list[ods.Row]:
                 "submissions in table",
                 "with metadata",
                 "unparseable",
+                "duplicate check ran",
                 "id from",
                 "script version",
                 "generated",
@@ -322,6 +361,7 @@ def summary_rows(reports: list[dict]) -> list[ods.Row]:
                 r["submissions_in_table"],
                 r["submissions_with_metadata"],
                 r["submissions_unparseable"],
+                duplicate_check_status(r),
                 r.get("grz_id_source", "unknown"),
                 r["script_version"],
                 r["generated"],
@@ -348,6 +388,23 @@ def summary_rows(reports: list[dict]) -> list[ods.Row]:
         rows.append(
             ods.Row(
                 [f"WARNING: reports produced by different script versions: {sorted(versions)}"],
+                style=ods.PROBLEM,
+            )
+        )
+
+    # Without this the reader cannot tell a site with no duplicates from a site
+    # where the check never ran: both show a column of zeroes.
+    unchecked = [r["_label"] for r in reports if duplicate_check_status(r) != "yes"]
+    if unchecked:
+        rows.append(ods.Row())
+        rows.append(
+            ods.Row(
+                [
+                    f"WARNING: duplicate initial submissions were not checked for "
+                    f"{', '.join(unchecked)} — that database is missing basic_qc_passed or "
+                    f"pseudonym, or the report predates the check. Read their zeroes as "
+                    f"'not checked', not 'none found'."
+                ],
                 style=ods.PROBLEM,
             )
         )
@@ -480,7 +537,7 @@ def build_spreadsheet(reports: list[dict], fields: list[Field]) -> OpenDocumentS
     """The whole file: a summary sheet, an index sheet, then one sheet per
     surveyed field in index order."""
     doc = ods.new_document()
-    ods.write_sheet(doc, "summary", summary_rows(reports), [ods.WIDE] + [ods.NARROW] * 6)
+    ods.write_sheet(doc, "summary", summary_rows(reports), [ods.WIDE] + [ods.NARROW] * 7)
     ods.write_sheet(doc, "index", index_rows(fields), [ods.NARROW, ods.WIDE, *[ods.NARROW] * 3, ods.WIDE])
     for f in fields:
         widths = [ods.WIDE] + [ods.NARROW] * (len(field_header(f)) - 1)

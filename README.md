@@ -27,11 +27,23 @@ Typical questions this answers:
 **It reads. It never writes.** The survey issues exactly one statement:
 
 ```sql
-SELECT id, submission_metadata FROM submissions
+SELECT id, submission_metadata, basic_qc_passed, pseudonym FROM submissions
 ```
 
 It then inspects the metadata JSON in Python. No JSON-path SQL is used, so the
 same code runs unchanged against SQLite and PostgreSQL.
+
+`basic_qc_passed` and `pseudonym` are the only columns read outside the metadata
+document, and one check uses them:
+[duplicate initial submissions](#duplicate-initial-submissions). A database old
+enough to predate either is detected before the query runs and read without
+them — that check then reports nothing and says so, and every other count is
+unaffected.
+
+**`pseudonym` here is not a donor pseudonym.** grz-db stores the submitter's
+`localCaseId` in a column named after the other field it redacts
+(`_METADATA_FIELD_TO_COLUMN` maps `local_case_id` to `pseudonym`). The donor
+pseudonyms live in the separate `donors` table, which this tool never reads.
 
 ### What leaves your site
 
@@ -46,13 +58,30 @@ The following are never read and never appear in the output:
 | Never touched | |
 |---|---|
 | `tanG` | |
-| `donorPseudonym`, `pseudonym` | |
-| `localCaseId` | |
-| `submitterId` | identifies the submitting institution under §293 SGB V |
+| `donorPseudonym`, the `donors` table's `pseudonym` | not the `submissions.pseudonym` column, which holds `localCaseId` |
 | `clinicalDataNodeId` | the KDK, not us |
 | `filePath`, `fileChecksum` | |
 | any date field | |
 | submission ids | the database's own row ids |
+
+Two more are read but **never written out**:
+
+| Read, never emitted | Where from | Why it is read |
+|---|---|---|
+| `submitterId` | the metadata document | identifies the submitting institution under §293 SGB V |
+| `localCaseId` | the `submissions.pseudonym` column | the LE's own case number |
+
+Both are needed by one check and one check only: whether an LE sent the same
+case as an `initial` submission more than once. The pair is used to group rows
+in memory and is then dropped. What reaches the report is the distribution
+alone — how many LEs duplicated nothing, how many duplicated once, and so on —
+with no identifier and no per-institution row.
+
+The **console** is the exception, deliberately: it names each duplicated
+`submitterId` and `localCaseId`, because it runs at the site that can go and
+look those cases up. That output is local. Do not paste it into a ticket or a
+mail to the coordination — send the report file, which cannot carry them. See
+[duplicate initial submissions](#duplicate-initial-submissions).
 
 **Open the report and read it before you send it.** The file is small,
 human-readable JSON, and the only part that is not a plain count is the
@@ -253,8 +282,9 @@ missing.
 
 The `.ods` contains:
 
-- **summary** — submissions seen per GRZ, where each GRZ's id came from, and a
-  warning if script versions differ
+- **summary** — submissions seen per GRZ, where each GRZ's id came from, whether
+  that database recorded QC status, and a warning row if script versions differ
+  or if some GRZ never ran the duplicate check
 - **index** — every surveyed field, with how many distinct values were used and —
   with `--schema` — how many values the schema declares and how many of those
   were never used
@@ -287,6 +317,106 @@ highlighted rows are the list of values still to be mapped or added.
 | Check | Question it answers |
 |---|---|
 | `tissueTypeId_is_BTO_format` | how many identifiers match `^BTO:[0-9]{7}$` |
+| `duplicate_initial_submissions_per_LE` | how many Leistungserbringer re-sent a case as a QC-passed `initial`, and exactly how many times each |
+| `initial_submissions_checked_for_duplicates` | how much of the input the check above could use, and why the rest was left out |
+
+### Duplicate initial submissions
+
+A case is meant to arrive once as `initial`. Anything after that is a
+`followup`, an `addition` or a `correction`. A second `initial` for a case an LE
+has already sent is therefore a re-submission nobody intended, and it inflates
+every count in this report along with everything else counted per submission.
+
+**Only submissions that passed basic QC count.** One that failed was rejected,
+and the LE was meant to send it again — counting that replacement as a duplicate
+would report the process working as a fault. This is grz-db's own definition:
+its `_qc_passed_initial_of` and its one-initial-per-case index both mean
+`basic_qc_passed IS TRUE`, and `detailed_qc_passed` is deliberately not used,
+since in-depth QC runs on a selected sample and filtering on it would discard
+most submissions rather than the failed ones. A `NULL` — QC not yet decided —
+is not a pass.
+
+Because grz-db's index already forbids a second QC-passed initial per case,
+what this check surfaces is the part that index does not reach: submissions
+from before it existed, and those with no case linked.
+
+The `localCaseId` half of the key comes from the `submissions.pseudonym` column,
+not from the metadata document, because grz-db **redacts** `localCaseId` in the
+JSON it stores, replacing it with `REDACTED_LOCAL_CASE_ID`. Reading the document
+would key every redacted submission of an LE on that one placeholder and report
+them all as duplicates of each other. A submission whose column still holds a
+placeholder, or nothing, identifies no case and is counted apart rather than
+grouped, which is also how grz-db's own `SubmitterLocalCaseResolver` treats it.
+
+The check groups the QC-passed initial submissions by `(submitterId, localCaseId)`,
+counts how many each LE sent beyond the first, and reports the **distribution
+over LEs**:
+
+```json
+"duplicate_initial_submissions_per_LE": {
+  "_total": 14, "_distinct": 4,
+  "values": { "0": 11, "1": 1, "2": 1, "7": 1 }
+}
+```
+
+Read as: of the 14 LEs that sent anything, 11 duplicated nothing, one
+duplicated once, one twice, and one sent seven initial submissions more than it
+should have. The key is the exact count, never a range and never the LE. An LE
+with several duplicated cases is counted across all of them, so `7` may be one
+case sent eight times or seven cases sent twice.
+
+Neither identifier appears in the report. Note that an exact count is a sharper
+key than a range: an LE with an unusual number is distinguishable by its row
+alone to anyone who already knows roughly how much it submits.
+
+`localCaseId` is the LE's own numbering, so it is only meaningful within one LE:
+two LEs both using `case-1` is not a duplicate, and the check does not treat it
+as one.
+
+A companion counter accounts for every initial submission, whether it was
+compared or not:
+
+```json
+"initial_submissions_checked_for_duplicates": {
+  "values": {
+    "yes": 812,
+    "no - basic QC not passed": 37,
+    "no - localCaseId redacted": 9,
+    "no - no submitterId or localCaseId": 4
+  }
+}
+```
+
+Each reason is written even at zero, so the duplicate count can be read as a
+total rather than a floor. `no - basic QC not passed` also covers submissions
+whose QC is still undecided; if it swallows nearly everything, check whether
+this database records QC at all.
+
+Across GRZs, two things about this metric are worth keeping in mind. A GRZ whose
+database lacks either column counts nothing, so its column is all
+zeroes and reads like a clean site: the report records
+`duplicate_check_available`, the **summary** sheet has a `duplicate check ran`
+column, and a highlighted warning row names any GRZ whose check never ran. And the TOTAL row adds LEs
+across GRZs, so an LE that submits to more than one GRZ is counted once per GRZ.
+Deduplicating would need the identifiers, which deliberately never leave the
+sites.
+
+### Acting on it
+
+The report says how many; the console says which. On every run the survey names
+every duplicated case, worst first, one line per affected LE:
+
+```
+warning: 2 of 14 Leistungserbringer sent the same case as a QC-passed initial submission more than once:
+  (these submitterIds and localCaseIds stay on this machine — the report carries only how many duplicates each LE had, and no identifier)
+    260000001: ABC-17 (3x), ABC-92 (2x)
+    260000002: XY-4 (2x)
+```
+
+`ABC-17 (3x)` means that case arrived as a QC-passed `initial` submission three
+times, so two of the three were unintended. Nothing is truncated, and nothing here
+goes into the report file. When no LE duplicated anything the survey says so
+instead, with the number of LEs it checked.
 
 ## Adding a field
 
